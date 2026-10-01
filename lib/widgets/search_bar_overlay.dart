@@ -6,6 +6,7 @@ class SearchBarOverlay extends StatelessWidget {
   final int totalMatches;
   final bool isSearching;
   final ValueChanged<String> onSearchSubmitted;
+  final ValueChanged<String>? onSearchChanged;
   final VoidCallback onNextMatch;
   final VoidCallback onPreviousMatch;
   final VoidCallback onClose;
@@ -17,6 +18,7 @@ class SearchBarOverlay extends StatelessWidget {
     required this.totalMatches,
     required this.isSearching,
     required this.onSearchSubmitted,
+    this.onSearchChanged,
     required this.onNextMatch,
     required this.onPreviousMatch,
     required this.onClose,
@@ -72,7 +74,9 @@ class SearchBarOverlay extends StatelessWidget {
                     ),
                     onSubmitted: onSearchSubmitted,
                     onChanged: (text) {
-                      if (text.length >= 2) {
+                      if (onSearchChanged != null) {
+                        onSearchChanged!(text);
+                      } else if (text.length >= 2) {
                         onSearchSubmitted(text);
                       }
                     },

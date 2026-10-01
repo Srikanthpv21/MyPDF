@@ -7,14 +7,22 @@ class PermissionService {
   PermissionService._();
   static final PermissionService instance = PermissionService._();
 
+  int? _cachedSdkInt;
+
+  Future<int> _getAndroidSdkInt() async {
+    if (_cachedSdkInt != null) return _cachedSdkInt!;
+    final androidInfo = await DeviceInfoPlugin().androidInfo;
+    _cachedSdkInt = androidInfo.version.sdkInt;
+    return _cachedSdkInt!;
+  }
+
   /// Check whether the app currently has permission to access PDF files on device.
   Future<bool> hasStoragePermission() async {
     if (kIsWeb) return true;
 
     if (Platform.isAndroid) {
       try {
-        final androidInfo = await DeviceInfoPlugin().androidInfo;
-        final sdkInt = androidInfo.version.sdkInt;
+        final sdkInt = await _getAndroidSdkInt();
 
         if (sdkInt >= 30) {
           final isManageGranted = await Permission.manageExternalStorage.isGranted;
@@ -42,8 +50,7 @@ class PermissionService {
 
     if (Platform.isAndroid) {
       try {
-        final androidInfo = await DeviceInfoPlugin().androidInfo;
-        final sdkInt = androidInfo.version.sdkInt;
+        final sdkInt = await _getAndroidSdkInt();
 
         if (sdkInt >= 30) {
           // On Android 11+ (API 30+), try manageExternalStorage for complete file access

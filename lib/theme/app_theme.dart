@@ -8,26 +8,21 @@ enum ReadingMode {
 }
 
 class AppTheme {
-  // Brand colors - Crimson Red theme
-  static const Color primary = Color(0xFFDC2626); // Crimson Red
-  static const Color primaryLight = Color(0xFFEF4444);
-  static const Color primaryDark = Color(0xFF991B1B);
-  static const Color accent = Color(0xFFF43F5E); // Crimson Rose
+  static const Color primary = Color(0xFFE11D48);
+  static const Color primaryLight = Color(0xFFFB7185);
+  static const Color primaryDark = Color(0xFFBE123C);
+  static const Color accent = Color(0xFFF43F5E);
 
-  // Surface colors (Dark Theme)
   static const Color darkBg = Color(0xFF0B0F19);
   static const Color darkSurface = Color(0xFF151C2C);
   static const Color darkCard = Color(0xFF1E293B);
   static const Color darkBorder = Color(0xFF334155);
 
-  // Surface colors (Light Theme)
   static const Color lightBg = Color(0xFFF8FAFC);
   static const Color lightSurface = Color(0xFFFFFFFF);
   static const Color lightCard = Color(0xFFF1F5F9);
   static const Color lightBorder = Color(0xFFE2E8F0);
 
-  // Reading Mode Color Filters for PDF Canvas
-  // 1. Inverted Night Matrix
   static const List<double> nightModeMatrix = <double>[
     -1.0, 0.0, 0.0, 0.0, 255.0,
     0.0, -1.0, 0.0, 0.0, 255.0,
@@ -35,7 +30,6 @@ class AppTheme {
     0.0, 0.0, 0.0, 1.0, 0.0,
   ];
 
-  // 2. Warm Sepia Filter Matrix
   static const List<double> sepiaModeMatrix = <double>[
     0.393 * 1.1, 0.769 * 0.9, 0.189 * 0.7, 0.0, 15.0,
     0.349 * 1.0, 0.686 * 1.0, 0.168 * 0.6, 0.0, 10.0,
@@ -64,8 +58,9 @@ class AppTheme {
         centerTitle: false,
         titleTextStyle: TextStyle(
           color: Colors.white,
-          fontSize: 17,
-          fontWeight: FontWeight.w600,
+          fontSize: 18,
+          fontWeight: FontWeight.bold,
+          letterSpacing: -0.2,
         ),
       ),
       cardTheme: CardThemeData(
@@ -107,8 +102,9 @@ class AppTheme {
         centerTitle: false,
         titleTextStyle: TextStyle(
           color: Color(0xFF0F172A),
-          fontSize: 17,
-          fontWeight: FontWeight.w600,
+          fontSize: 18,
+          fontWeight: FontWeight.bold,
+          letterSpacing: -0.2,
         ),
       ),
       cardTheme: CardThemeData(

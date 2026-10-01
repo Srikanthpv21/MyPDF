@@ -1,5 +1,8 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
 import '../models/pdf_document_item.dart';
 import '../services/device_pdf_service.dart';
@@ -59,18 +62,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
 
   final ValueNotifier<int> _currentPageNotifier = ValueNotifier<int>(1);
   DateTime _lastTapTime = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastDocumentOpenTime = DateTime.fromMillisecondsSinceEpoch(0);
+  Map<String, int> _readingProgress = {};
   File? _cachedFile;
+  Timer? _searchDebounceTimer;
+  Timer? _homeSearchDebounceTimer;
 
   void _updateFilteredDocs() {
     final query = _homeSearchFilter.trim().toLowerCase();
     if (query.isEmpty) {
       _filteredDocs = List.unmodifiable(_devicePdfs);
     } else {
-      _filteredDocs = _devicePdfs.where((doc) {
-        return doc.title.toLowerCase().contains(query) ||
-            doc.subtitle.toLowerCase().contains(query) ||
-            doc.path.toLowerCase().contains(query);
-      }).toList();
+      _filteredDocs = _devicePdfs.where((doc) => doc.matchesQuery(query)).toList();
     }
   }
 
@@ -84,14 +87,92 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
     _currentPageNotifier.value = _currentPage;
     _updateFilteredDocs();
 
-    // Ask for access to device PDF files and load documents when opened
+    _loadCachedPdfLibrary();
+    _setupIntentChannel();
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkAndPromptPdfAccess();
     });
   }
 
+  static const _intentChannel = MethodChannel('com.example.pdf_viewer/intent');
+
+  void _setupIntentChannel() {
+    _intentChannel.setMethodCallHandler((call) async {
+      if (call.method == 'onPdfOpened') {
+        final path = call.arguments as String?;
+        if (path != null && path.isNotEmpty && mounted) {
+          _openDocumentFromPath(path);
+        }
+      }
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _intentChannel.invokeMethod<String>('getInitialPdf').then((path) {
+        if (path != null && path.isNotEmpty && mounted) {
+          _openDocumentFromPath(path);
+        }
+      }).catchError((_) {});
+    });
+  }
+
+  void _openDocumentFromPath(String path) {
+    if (!path.toLowerCase().endsWith('.pdf')) {
+      debugPrint('Security warning: Refused to open non-PDF file: $path');
+      return;
+    }
+    final file = File(path);
+    if (!file.existsSync()) return;
+
+    final fileName = file.uri.pathSegments.lastWhere((s) => s.isNotEmpty, orElse: () => 'Document.pdf');
+    int sizeInBytes = 0;
+    DateTime? modified;
+    try {
+      final stat = file.statSync();
+      sizeInBytes = stat.size;
+      modified = stat.modified;
+    } catch (_) {}
+
+    final formattedSize = sizeInBytes >= 1024 * 1024
+        ? '${(sizeInBytes / (1024 * 1024)).toStringAsFixed(1)} MB'
+        : '${(sizeInBytes / 1024).toStringAsFixed(1)} KB';
+
+    final docItem = PdfDocumentItem(
+      id: file.path,
+      title: fileName,
+      subtitle: 'External File | $formattedSize',
+      type: PdfSourceType.file,
+      path: file.path,
+      fileSize: formattedSize,
+      lastModified: modified,
+    );
+
+    if (!_devicePdfs.any((d) => d.id == docItem.id || (d.path.isNotEmpty && d.path == docItem.path))) {
+      _devicePdfs.insert(0, docItem);
+      _updateFilteredDocs();
+      DevicePdfService.instance.saveCachedPdfs(_devicePdfs);
+    }
+    _openDocument(docItem);
+  }
+
+  Future<void> _loadCachedPdfLibrary() async {
+    final cached = await DevicePdfService.instance.loadCachedPdfs();
+    final progress = await DevicePdfService.instance.loadReadingProgress();
+    if (mounted) {
+      setState(() {
+        _readingProgress = progress;
+        if (cached.isNotEmpty && _devicePdfs.isEmpty) {
+          _devicePdfs = cached;
+          _updateFilteredDocs();
+        }
+      });
+    }
+  }
+
   @override
   void dispose() {
+    _searchDebounceTimer?.cancel();
+    _homeSearchDebounceTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _currentPageNotifier.dispose();
     _homeScrollController.dispose();
@@ -105,8 +186,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+      _saveCurrentReadingProgress();
+    } else if (state == AppLifecycleState.resumed) {
       _onAppResumed();
+    }
+  }
+
+  void _saveCurrentReadingProgress() {
+    if (_currentDocument != null) {
+      _readingProgress[_currentDocument!.id] = _currentPage;
+      DevicePdfService.instance.saveReadingProgress(_readingProgress);
     }
   }
 
@@ -128,15 +218,29 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
       _isDocumentLoaded = true;
       _hasLoadError = false;
       _loadErrorMessage = null;
-      _currentPage = 1;
-      _currentPageNotifier.value = 1;
+
+      final savedPage = _currentDocument != null ? (_readingProgress[_currentDocument!.id] ?? 1) : 1;
+      if (savedPage > 1 && savedPage <= _totalPages) {
+        _currentPage = savedPage;
+        _currentPageNotifier.value = savedPage;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          try {
+            _pdfViewerController.jumpToPage(savedPage);
+          } catch (_) {}
+        });
+      } else {
+        _currentPage = 1;
+        _currentPageNotifier.value = 1;
+      }
     });
   }
 
   void _onPageChanged(PdfPageChangedDetails details) {
-    // Decoupled from full-screen setState: updates notifier for app bar without rebuilding entire viewer
     _currentPage = details.newPageNumber;
     _currentPageNotifier.value = details.newPageNumber;
+    if (_currentDocument != null) {
+      _readingProgress[_currentDocument!.id] = details.newPageNumber;
+    }
   }
 
   void _onDocumentLoadFailed(PdfDocumentLoadFailedDetails details) {
@@ -159,6 +263,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
   }
 
   void _toggleBookmark(int pageNumber) {
+    HapticFeedback.mediumImpact();
     setState(() {
       if (_bookmarkedPages.contains(pageNumber)) {
         _bookmarkedPages.remove(pageNumber);
@@ -224,6 +329,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
           _updateFilteredDocs();
           _isScanningDevicePdfs = false;
         });
+        // Save scan result to persistent cache asynchronously
+        DevicePdfService.instance.saveCachedPdfs(pdfs);
       }
     } catch (e) {
       debugPrint('Error scanning PDFs: $e');
@@ -238,21 +345,71 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
       _toggleSelect(doc);
       return;
     }
+
+    final now = DateTime.now();
+    if (now.difference(_lastDocumentOpenTime).inMilliseconds < 350) {
+      return;
+    }
+    _lastDocumentOpenTime = now;
+
+    _searchResult?.removeListener(_onSearchResultChanged);
+    _searchResult?.clear();
+    _searchController.clear();
+    _isSearchOpen = false;
+    _searchResult = null;
+    _currentMatchIndex = 0;
+    _totalMatches = 0;
+    _isSearching = false;
+
+    try {
+      _pdfViewerController.dispose();
+    } catch (_) {}
+
     _cachedFile = doc.type == PdfSourceType.file && doc.path.isNotEmpty ? File(doc.path) : null;
+    _pdfViewerController = PdfViewerController();
+
+    final savedPage = _readingProgress[doc.id] ?? 1;
+    _currentPage = savedPage;
+    _currentPageNotifier.value = savedPage;
+    _totalPages = doc.pageCount;
+    _bookmarkedPages.clear();
+
     setState(() {
       _currentDocument = doc;
       _isDocumentLoaded = false;
       _hasLoadError = false;
       _loadErrorMessage = null;
-      _currentPage = 1;
-      _currentPageNotifier.value = 1;
-      _totalPages = doc.pageCount;
-      _bookmarkedPages.clear();
-      _closeSearch();
+    });
+  }
+
+  void _closeDocument() {
+    if (_currentDocument != null) {
+      _readingProgress[_currentDocument!.id] = _currentPage;
+      DevicePdfService.instance.saveReadingProgress(_readingProgress);
+    }
+    _searchResult?.removeListener(_onSearchResultChanged);
+    _searchResult?.clear();
+    _searchController.clear();
+    _isSearchOpen = false;
+    _searchResult = null;
+    _cachedFile = null;
+
+    try {
+      _pdfViewerController.dispose();
+    } catch (_) {}
+    _pdfViewerController = PdfViewerController();
+
+    setState(() {
+      _currentDocument = null;
+      _isDocumentLoaded = false;
+      _hasLoadError = false;
+      _loadErrorMessage = null;
+      _isFullScreen = false;
     });
   }
 
   void _toggleSelect(PdfDocumentItem doc) {
+    HapticFeedback.lightImpact();
     setState(() {
       if (_selectedDocumentIds.contains(doc.id)) {
         _selectedDocumentIds.remove(doc.id);
@@ -263,6 +420,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
   }
 
   void _selectAll(List<PdfDocumentItem> docs) {
+    HapticFeedback.lightImpact();
     setState(() {
       if (_selectedDocumentIds.length == docs.length) {
         _selectedDocumentIds.clear();
@@ -273,6 +431,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
   }
 
   void _clearSelection() {
+    HapticFeedback.selectionClick();
     setState(() {
       _selectedDocumentIds.clear();
     });
@@ -293,16 +452,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
 
   Future<void> _renameSingleSelected() async {
     if (_selectedDocumentIds.length != 1) return;
-    final selectedDoc = _devicePdfs.firstWhere((d) => _selectedDocumentIds.contains(d.id));
-    await _promptRenameDocument(selectedDoc);
+    final selectedId = _selectedDocumentIds.first;
+    final index = _devicePdfs.indexWhere((d) => d.id == selectedId);
+    if (index != -1) {
+      await _promptRenameDocument(_devicePdfs[index]);
+    }
     _clearSelection();
   }
 
-  Future<void> _promptDeleteSelectedDocuments() async {
-    final selectedDocs = _devicePdfs.where((d) => _selectedDocumentIds.contains(d.id)).toList();
-    if (selectedDocs.isEmpty) return;
+  Future<void> _promptDeleteDocuments(List<PdfDocumentItem> docsToDelete) async {
+    if (docsToDelete.isEmpty) return;
 
-    final count = selectedDocs.length;
+    final count = docsToDelete.length;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) {
@@ -331,7 +492,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
           ),
           content: Text(
             count == 1
-                ? 'Are you sure you want to permanently delete "${selectedDocs.first.title}" from your device?'
+                ? 'Are you sure you want to permanently delete "${docsToDelete.first.title}" from your device storage? This action cannot be undone.'
                 : 'Are you sure you want to permanently delete these $count selected documents from your device storage? This action cannot be undone.',
             style: TextStyle(
               fontSize: 14,
@@ -364,83 +525,36 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
     );
 
     if (confirmed == true && mounted) {
-      final deletedCount = await DevicePdfService.instance.deletePdfs(selectedDocs);
+      final idsToDelete = docsToDelete.map((d) => d.id).toSet();
+      final pathsToDelete = docsToDelete.map((d) => d.path).where((p) => p.isNotEmpty).toSet();
+      final deletedCount = await DevicePdfService.instance.deletePdfs(docsToDelete);
+
       setState(() {
-        _devicePdfs.removeWhere((d) => _selectedDocumentIds.contains(d.id));
-        _selectedDocumentIds.clear();
+        _devicePdfs.removeWhere((d) => idsToDelete.contains(d.id) || pathsToDelete.contains(d.path));
+        _selectedDocumentIds.removeWhere((id) => idsToDelete.contains(id));
         _updateFilteredDocs();
+
+        if (_currentDocument != null &&
+            (idsToDelete.contains(_currentDocument!.id) || pathsToDelete.contains(_currentDocument!.path))) {
+          _closeDocument();
+        }
       });
+
+      DevicePdfService.instance.saveCachedPdfs(_devicePdfs);
+
       _showNotification(
         deletedCount == 1 ? 'Document deleted' : '$deletedCount documents deleted',
       );
     }
   }
 
-  Future<void> _promptDeleteSingleDocument(PdfDocumentItem doc) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) {
-        final isDark = Theme.of(ctx).brightness == Brightness.dark;
-        return AlertDialog(
-          backgroundColor: isDark ? const Color(0xFF1E293B) : Colors.white,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          title: Row(
-            children: [
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.redAccent.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: const Icon(Icons.delete_outline_rounded, color: Colors.redAccent, size: 24),
-              ),
-              const SizedBox(width: 12),
-              const Expanded(
-                child: Text('Delete PDF?', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-              ),
-            ],
-          ),
-          content: Text(
-            'Are you sure you want to permanently delete "${doc.title}" from your device storage? This action cannot be undone.',
-            style: TextStyle(fontSize: 14, color: isDark ? Colors.white70 : const Color(0xFF475569)),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(false),
-              child: Text(
-                'Cancel',
-                style: TextStyle(
-                  color: isDark ? Colors.white70 : const Color(0xFF64748B),
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.redAccent,
-                foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-              ),
-              onPressed: () => Navigator.of(ctx).pop(true),
-              child: const Text('Delete', style: TextStyle(fontWeight: FontWeight.bold)),
-            ),
-          ],
-        );
-      },
-    );
+  Future<void> _promptDeleteSelectedDocuments() async {
+    final selectedDocs = _devicePdfs.where((d) => _selectedDocumentIds.contains(d.id)).toList();
+    await _promptDeleteDocuments(selectedDocs);
+  }
 
-    if (confirmed == true && mounted) {
-      await DevicePdfService.instance.deletePdf(doc);
-      setState(() {
-        _devicePdfs.removeWhere((d) => d.id == doc.id || (d.path.isNotEmpty && d.path == doc.path));
-        _selectedDocumentIds.remove(doc.id);
-        _updateFilteredDocs();
-        if (_currentDocument?.id == doc.id || _currentDocument?.path == doc.path) {
-          _currentDocument = null;
-        }
-      });
-      _showNotification('Document "${doc.title}" deleted');
-    }
+  Future<void> _promptDeleteSingleDocument(PdfDocumentItem doc) async {
+    await _promptDeleteDocuments([doc]);
   }
 
   Future<void> _promptRenameDocument(PdfDocumentItem doc) async {
@@ -463,6 +577,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
               : null;
         }
       });
+      DevicePdfService.instance.saveCachedPdfs(_devicePdfs);
       _showNotification('Renamed to "${updatedDoc.title}"');
     }
   }
@@ -477,14 +592,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
     }
   }
 
-  Future<void> _checkAndPromptPdfAccess() async {
+  Future<void> _checkAndPromptPdfAccess({bool openPickerIfGranted = false}) async {
     final hasPermission = await PermissionService.instance.hasStoragePermission();
     if (mounted) {
       setState(() => _hasStoragePermission = hasPermission);
     }
 
     if (hasPermission) {
-      await _scanAndLoadDevicePdfs();
+      if (openPickerIfGranted) {
+        await _pickAndOpenDevicePdf();
+      } else {
+        await _scanAndLoadDevicePdfs();
+      }
       return;
     }
 
@@ -506,26 +625,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
     }
   }
 
-  Future<void> _promptPermissionOrPick() async {
-    final hasPermission = await PermissionService.instance.hasStoragePermission();
-    if (!hasPermission && mounted) {
-      final result = await StoragePermissionDialog.show(context);
-      if (!mounted) return;
-
-      final updated = await PermissionService.instance.hasStoragePermission();
-      if (mounted) {
-        setState(() => _hasStoragePermission = updated);
-      }
-
-      if (updated || result == StoragePermissionDialogResult.granted) {
-        await _scanAndLoadDevicePdfs();
-      } else if (result == StoragePermissionDialogResult.pickFile) {
-        await _pickAndOpenDevicePdf();
-      }
-    } else {
-      await _pickAndOpenDevicePdf();
-    }
-  }
+  Future<void> _promptPermissionOrPick() => _checkAndPromptPdfAccess(openPickerIfGranted: true);
 
   Future<void> _pickAndOpenDevicePdf() async {
     try {
@@ -534,6 +634,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
         if (!_devicePdfs.any((d) => d.id == item.id || (d.path.isNotEmpty && d.path == item.path))) {
           _devicePdfs.insert(0, item);
           _updateFilteredDocs();
+          DevicePdfService.instance.saveCachedPdfs(_devicePdfs);
         }
         _openDocument(item);
         _showNotification('Opened: ${item.title}');
@@ -552,6 +653,28 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
     _searchResult?.removeListener(_onSearchResultChanged);
     _searchResult = _pdfViewerController.searchText(query);
     _searchResult?.addListener(_onSearchResultChanged);
+  }
+
+  void _onSearchQueryChanged(String query) {
+    _searchDebounceTimer?.cancel();
+    final trimmed = query.trim();
+    if (trimmed.isEmpty) {
+      _searchResult?.removeListener(_onSearchResultChanged);
+      _searchResult?.clear();
+      setState(() {
+        _searchResult = null;
+        _currentMatchIndex = 0;
+        _totalMatches = 0;
+        _isSearching = false;
+      });
+      return;
+    }
+    if (trimmed.length < 2) return;
+    _searchDebounceTimer = Timer(const Duration(milliseconds: 380), () {
+      if (mounted) {
+        _startSearch(trimmed);
+      }
+    });
   }
 
   void _onSearchResultChanged() {
@@ -579,6 +702,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
   }
 
   void _closeSearch() {
+    _searchDebounceTimer?.cancel();
     _searchResult?.removeListener(_onSearchResultChanged);
     _searchResult?.clear();
     _searchController.clear();
@@ -589,6 +713,23 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
       _totalMatches = 0;
       _isSearching = false;
     });
+  }
+
+  void _onHomeSearchChanged(String val) {
+    _homeSearchFilter = val;
+    _homeSearchDebounceTimer?.cancel();
+    if (val.isEmpty) {
+      _updateFilteredDocs();
+      setState(() {});
+    } else {
+      _homeSearchDebounceTimer = Timer(const Duration(milliseconds: 180), () {
+        if (mounted) {
+          setState(() {
+            _updateFilteredDocs();
+          });
+        }
+      });
+    }
   }
 
   void _zoomIn() {
@@ -623,254 +764,161 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
     return RefreshIndicator(
       onRefresh: _scanAndLoadDevicePdfs,
       color: primaryColor,
-      child: CustomScrollView(
-        key: const PageStorageKey<String>('home_pdf_library_scroll'),
+      child: Scrollbar(
         controller: _homeScrollController,
-        physics: const AlwaysScrollableScrollPhysics(),
-        slivers: [
-          SliverToBoxAdapter(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // Search Bar
-                  Container(
-                    decoration: BoxDecoration(
-                      color: cardBg,
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(color: borderColor),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: isDark ? 0.2 : 0.05),
-                          blurRadius: 10,
-                          offset: const Offset(0, 2),
-                        ),
-                      ],
-                    ),
-                    child: TextField(
-                      controller: _homeSearchController,
-                      onChanged: (val) {
-                        _homeSearchFilter = val;
-                        _updateFilteredDocs();
-                        setState(() {});
-                      },
-                      style: TextStyle(
-                        fontSize: 14,
-                        color: isDark ? Colors.white : const Color(0xFF0F172A),
-                      ),
-                      decoration: InputDecoration(
-                        hintText: 'Search PDF documents by name or folder...',
-                        hintStyle: TextStyle(
-                          color: isDark ? Colors.white38 : const Color(0xFF94A3B8),
-                          fontSize: 14,
-                        ),
-                        prefixIcon: Icon(
-                          Icons.search_rounded,
-                          color: isDark ? Colors.white54 : const Color(0xFF64748B),
-                        ),
-                        suffixIcon: _homeSearchFilter.isNotEmpty
-                            ? IconButton(
-                                icon: const Icon(Icons.clear_rounded, size: 18),
-                                onPressed: () {
-                                  _homeSearchController.clear();
-                                  _homeSearchFilter = '';
-                                  _updateFilteredDocs();
-                                  setState(() {});
-                                },
-                              )
-                            : null,
-                        border: InputBorder.none,
-                        contentPadding: const EdgeInsets.symmetric(vertical: 14),
-                      ),
-                    ),
-                  ),
-
-                  const SizedBox(height: 12),
-
-                  // Quick Action: Browse any folder via system file picker
-                  InkWell(
-                    onTap: _pickAndOpenDevicePdf,
+        interactive: true,
+        thickness: 6.0,
+        radius: const Radius.circular(8),
+        child: CustomScrollView(
+          key: const PageStorageKey<String>('home_pdf_library_scroll'),
+          controller: _homeScrollController,
+          physics: const FastMomentumScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+          slivers: [
+          if (!_hasStoragePermission)
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                child: Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: Colors.amber.withValues(alpha: isDark ? 0.15 : 0.1),
                     borderRadius: BorderRadius.circular(16),
-                    child: Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        gradient: const LinearGradient(
-                          colors: [AppTheme.primary, AppTheme.accent],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                        ),
-                        borderRadius: BorderRadius.circular(16),
-                        boxShadow: [
-                          BoxShadow(
-                            color: AppTheme.primary.withValues(alpha: 0.3),
-                            blurRadius: 12,
-                            offset: const Offset(0, 4),
-                          ),
-                        ],
-                      ),
-                      child: Row(
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.all(10),
-                            decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: 0.2),
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: const Icon(
-                              Icons.folder_open_rounded,
-                              color: Colors.white,
-                              size: 24,
-                            ),
-                          ),
-                          const SizedBox(width: 14),
-                          const Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  'Browse Any PDF File',
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                                SizedBox(height: 2),
-                                Text(
-                                  'Open files from Google Drive, SD Card & custom folders',
-                                  style: TextStyle(
-                                    color: Colors.white70,
-                                    fontSize: 12,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const Icon(
-                            Icons.arrow_forward_ios_rounded,
-                            color: Colors.white70,
-                            size: 16,
-                          ),
-                        ],
-                      ),
+                    border: Border.all(
+                      color: Colors.amber.withValues(alpha: 0.4),
                     ),
                   ),
-
-                  // Permission required notice banner (if not yet granted)
-                  if (!_hasStoragePermission) ...[
-                    const SizedBox(height: 12),
-                    Container(
-                      padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                        color: Colors.amber.withValues(alpha: isDark ? 0.15 : 0.1),
-                        borderRadius: BorderRadius.circular(16),
-                        border: Border.all(
-                          color: Colors.amber.withValues(alpha: 0.4),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.info_outline_rounded, color: Colors.amber, size: 22),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Storage Permission Needed',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13.5,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              'Grant permission to list all PDF documents on your phone automatically.',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: isDark ? Colors.white70 : const Color(0xFF475569),
+                              ),
+                            ),
+                          ],
                         ),
                       ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.info_outline_rounded, color: Colors.amber, size: 22),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  'Storage Permission Needed',
-                                  style: TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 13.5,
-                                  ),
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  'Grant permission to list all PDF documents on your phone automatically.',
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    color: isDark ? Colors.white70 : const Color(0xFF475569),
-                                  ),
-                                ),
-                              ],
-                            ),
+                      const SizedBox(width: 8),
+                      ElevatedButton(
+                        onPressed: _promptPermissionOrPick,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.amber.shade700,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
                           ),
-                          const SizedBox(width: 8),
-                          ElevatedButton(
-                            onPressed: _promptPermissionOrPick,
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.amber.shade700,
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(10),
-                              ),
-                            ),
-                            child: const Text('Allow', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-
-                  const SizedBox(height: 18),
-
-                  // Section Header
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Row(
-                        children: [
-                          Text(
-                            'PDF DOCUMENTS',
-                            style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w700,
-                              letterSpacing: 1.1,
-                              color: isDark ? Colors.white54 : const Color(0xFF64748B),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: primaryColor.withValues(alpha: 0.15),
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            child: Text(
-                              '${filteredDocs.length}',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.bold,
-                                color: primaryColor,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                      IconButton(
-                        icon: _isScanningDevicePdfs
-                            ? const SizedBox(
-                                width: 16,
-                                height: 16,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : Icon(
-                                Icons.refresh_rounded,
-                                size: 20,
-                                color: isDark ? Colors.white54 : const Color(0xFF64748B),
-                              ),
-                        tooltip: 'Rescan Storage',
-                        onPressed: _isScanningDevicePdfs ? null : _scanAndLoadDevicePdfs,
+                        ),
+                        child: const Text('Allow', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
                       ),
                     ],
+                  ),
+                ),
+              ),
+            ),
+
+          SliverPersistentHeader(
+            pinned: true,
+            delegate: _PinnedSearchBarDelegate(
+              height: 68.0,
+              backgroundColor: _canvasBackgroundColor(isDark),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: cardBg,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: borderColor),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: isDark ? 0.2 : 0.05),
+                      blurRadius: 10,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
+                ),
+                child: TextField(
+                  controller: _homeSearchController,
+                  onChanged: _onHomeSearchChanged,
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: isDark ? Colors.white : const Color(0xFF0F172A),
+                  ),
+                  decoration: InputDecoration(
+                    hintText: 'Search PDF documents by name or folder...',
+                    hintStyle: TextStyle(
+                      color: isDark ? Colors.white38 : const Color(0xFF94A3B8),
+                      fontSize: 14,
+                    ),
+                    prefixIcon: Icon(
+                      Icons.search_rounded,
+                      color: isDark ? Colors.white54 : const Color(0xFF64748B),
+                    ),
+                    suffixIcon: _homeSearchFilter.isNotEmpty
+                        ? IconButton(
+                            icon: const Icon(Icons.clear_rounded, size: 18),
+                            onPressed: () {
+                              _homeSearchController.clear();
+                              _onHomeSearchChanged('');
+                            },
+                          )
+                        : null,
+                    border: InputBorder.none,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                ),
+              ),
+            ),
+          ),
+
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              child: Row(
+                children: [
+                  Text(
+                    'PDF DOCUMENTS',
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 1.2,
+                      color: isDark ? const Color(0xFF94A3B8) : const Color(0xFF64748B),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: primaryColor.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      '${filteredDocs.length}',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                        color: primaryColor,
+                      ),
+                    ),
                   ),
                 ],
               ),
             ),
           ),
 
-          // Scanning indicator or Empty state or PDF list
           if (_isScanningDevicePdfs && _devicePdfs.isEmpty)
             SliverFillRemaining(
               hasScrollBody: false,
@@ -952,11 +1000,63 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
           else
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-              sliver: SliverList(
+              sliver: SliverPrototypeExtentList(
+                prototypeItem: Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(width: 0.8),
+                    ),
+                    child: const Row(
+                      children: [
+                        SizedBox(width: 44, height: 44),
+                        SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                'Prototype Document Title.pdf',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                  letterSpacing: -0.2,
+                                ),
+                              ),
+                              SizedBox(height: 3),
+                              Row(
+                                children: [
+                                  Text(
+                                    'Downloads | 1.0 MB',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 12.5,
+                                      height: 1.3,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                        SizedBox(width: 24, height: 24),
+                      ],
+                    ),
+                  ),
+                ),
                 delegate: SliverChildBuilderDelegate(
                   (context, index) {
                     final doc = filteredDocs[index];
                     final isSelected = _selectedDocumentIds.contains(doc.id);
+                    final savedPage = _readingProgress[doc.id] ?? 1;
+                    final hasProgress = savedPage > 1;
+
                     return Padding(
                       padding: const EdgeInsets.only(bottom: 10),
                       child: InkWell(
@@ -967,10 +1067,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                             _openDocument(doc);
                           }
                         },
-                        onLongPress: () => _toggleSelect(doc),
+                        onLongPress: () {
+                          HapticFeedback.mediumImpact();
+                          _toggleSelect(doc);
+                        },
                         borderRadius: BorderRadius.circular(16),
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 180),
+                        child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                           decoration: BoxDecoration(
                             color: isSelected
@@ -1001,7 +1103,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                                       ? primaryColor
                                       : (_isSelectionMode
                                           ? (isDark ? const Color(0xFF334155) : const Color(0xFFE2E8F0))
-                                          : Colors.redAccent.withValues(alpha: 0.12)),
+                                          : primaryColor.withValues(alpha: 0.12)),
                                   borderRadius: BorderRadius.circular(12),
                                 ),
                                 child: Center(
@@ -1011,9 +1113,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                                           color: isSelected ? Colors.white : (isDark ? Colors.white38 : Colors.black38),
                                           size: 22,
                                         )
-                                      : const Icon(
+                                      : Icon(
                                           Icons.picture_as_pdf_rounded,
-                                          color: Colors.redAccent,
+                                          color: primaryColor,
                                           size: 24,
                                         ),
                                 ),
@@ -1022,26 +1124,53 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                               Expanded(
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
                                   children: [
                                     Text(
                                       doc.title,
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
                                       style: TextStyle(
-                                        fontSize: 14,
+                                        fontSize: 15,
                                         fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
+                                        letterSpacing: -0.2,
                                         color: isDark ? Colors.white : const Color(0xFF0F172A),
                                       ),
                                     ),
                                     const SizedBox(height: 3),
-                                    Text(
-                                      doc.subtitle,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        color: isDark ? Colors.white54 : const Color(0xFF64748B),
-                                      ),
+                                    Row(
+                                      children: [
+                                        Flexible(
+                                          child: Text(
+                                            doc.subtitle,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              fontSize: 12.5,
+                                              height: 1.3,
+                                              color: isDark ? const Color(0xFF94A3B8) : const Color(0xFF64748B),
+                                            ),
+                                          ),
+                                        ),
+                                        if (hasProgress) ...[
+                                          const SizedBox(width: 8),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                                            decoration: BoxDecoration(
+                                              color: primaryColor.withValues(alpha: isDark ? 0.22 : 0.10),
+                                              borderRadius: BorderRadius.circular(6),
+                                            ),
+                                            child: Text(
+                                              doc.pageCount > 0 ? 'P. $savedPage / ${doc.pageCount}' : 'P. $savedPage',
+                                              style: TextStyle(
+                                                fontSize: 10.5,
+                                                fontWeight: FontWeight.bold,
+                                                color: primaryColor,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ],
                                     ),
                                   ],
                                 ),
@@ -1144,6 +1273,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
               ),
             ),
         ],
+        ),
       ),
     );
   }
@@ -1167,82 +1297,40 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
     final layoutMode = _isContinuous ? PdfPageLayoutMode.continuous : PdfPageLayoutMode.single;
 
     Widget viewer;
-    switch (doc.type) {
-      case PdfSourceType.file:
-        viewer = SfPdfViewer.file(
-          _cachedFile ?? File(doc.path),
-          key: key,
-          controller: _pdfViewerController,
-          pageLayoutMode: layoutMode,
-          scrollDirection: PdfScrollDirection.vertical,
-          enableDoubleTapZooming: true,
-          canShowPaginationDialog: false,
-          enableTextSelection: false,
-          interactionMode: PdfInteractionMode.pan,
-          maxZoomLevel: 3.5,
-          onTap: _onViewerTap,
-          onDocumentLoaded: _onDocumentLoaded,
-          onPageChanged: _onPageChanged,
-          onDocumentLoadFailed: _onDocumentLoadFailed,
-        );
-        break;
-
-      case PdfSourceType.memory:
-        viewer = SfPdfViewer.memory(
-          doc.bytes!,
-          key: key,
-          controller: _pdfViewerController,
-          pageLayoutMode: layoutMode,
-          scrollDirection: PdfScrollDirection.vertical,
-          enableDoubleTapZooming: true,
-          canShowPaginationDialog: false,
-          enableTextSelection: false,
-          interactionMode: PdfInteractionMode.pan,
-          maxZoomLevel: 3.5,
-          onTap: _onViewerTap,
-          onDocumentLoaded: _onDocumentLoaded,
-          onPageChanged: _onPageChanged,
-          onDocumentLoadFailed: _onDocumentLoadFailed,
-        );
-        break;
-
-      case PdfSourceType.asset:
-        viewer = SfPdfViewer.asset(
-          doc.path,
-          key: key,
-          controller: _pdfViewerController,
-          pageLayoutMode: layoutMode,
-          scrollDirection: PdfScrollDirection.vertical,
-          enableDoubleTapZooming: true,
-          canShowPaginationDialog: false,
-          enableTextSelection: false,
-          interactionMode: PdfInteractionMode.pan,
-          maxZoomLevel: 3.5,
-          onTap: _onViewerTap,
-          onDocumentLoaded: _onDocumentLoaded,
-          onPageChanged: _onPageChanged,
-          onDocumentLoadFailed: _onDocumentLoadFailed,
-        );
-        break;
-
-      case PdfSourceType.network:
-        viewer = SfPdfViewer.network(
-          doc.path,
-          key: key,
-          controller: _pdfViewerController,
-          pageLayoutMode: layoutMode,
-          scrollDirection: PdfScrollDirection.vertical,
-          enableDoubleTapZooming: true,
-          canShowPaginationDialog: false,
-          enableTextSelection: false,
-          interactionMode: PdfInteractionMode.pan,
-          maxZoomLevel: 3.5,
-          onTap: _onViewerTap,
-          onDocumentLoaded: _onDocumentLoaded,
-          onPageChanged: _onPageChanged,
-          onDocumentLoadFailed: _onDocumentLoadFailed,
-        );
-        break;
+    if (doc.type == PdfSourceType.memory && doc.bytes != null) {
+      viewer = SfPdfViewer.memory(
+        doc.bytes!,
+        key: key,
+        controller: _pdfViewerController,
+        pageLayoutMode: layoutMode,
+        scrollDirection: PdfScrollDirection.vertical,
+        enableDoubleTapZooming: true,
+        canShowPaginationDialog: false,
+        enableTextSelection: false,
+        interactionMode: PdfInteractionMode.pan,
+        maxZoomLevel: 4.0,
+        onTap: _onViewerTap,
+        onDocumentLoaded: _onDocumentLoaded,
+        onPageChanged: _onPageChanged,
+        onDocumentLoadFailed: _onDocumentLoadFailed,
+      );
+    } else {
+      viewer = SfPdfViewer.file(
+        _cachedFile ?? File(doc.path),
+        key: key,
+        controller: _pdfViewerController,
+        pageLayoutMode: layoutMode,
+        scrollDirection: PdfScrollDirection.vertical,
+        enableDoubleTapZooming: true,
+        canShowPaginationDialog: false,
+        enableTextSelection: false,
+        interactionMode: PdfInteractionMode.pan,
+        maxZoomLevel: 4.0,
+        onTap: _onViewerTap,
+        onDocumentLoaded: _onDocumentLoaded,
+        onPageChanged: _onPageChanged,
+        onDocumentLoadFailed: _onDocumentLoadFailed,
+      );
     }
 
     if (_readingMode == ReadingMode.night) {
@@ -1261,6 +1349,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
   }
 
   Color _canvasBackgroundColor(bool isDark) {
+    if (_currentDocument == null) {
+      return isDark ? const Color(0xFF0B0F19) : const Color(0xFFF1F5F9);
+    }
     switch (_readingMode) {
       case ReadingMode.night:
         return const Color(0xFF0F172A);
@@ -1289,7 +1380,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
         } else if (_isFullScreen) {
           setState(() => _isFullScreen = false);
         } else if (_currentDocument != null) {
-          setState(() => _currentDocument = null);
+          _closeDocument();
         }
       },
       child: Scaffold(
@@ -1306,6 +1397,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                         totalMatches: _totalMatches,
                         isSearching: _isSearching,
                         onSearchSubmitted: _startSearch,
+                        onSearchChanged: _onSearchQueryChanged,
                         onNextMatch: _nextMatch,
                         onPreviousMatch: _previousMatch,
                         onClose: _closeSearch,
@@ -1389,6 +1481,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                                     'assets/icon/app_logo.png',
                                     width: 32,
                                     height: 32,
+                                    cacheWidth: 64,
+                                    cacheHeight: 64,
                                     fit: BoxFit.contain,
                                   ),
                                 ),
@@ -1402,7 +1496,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                                   'MYPDF',
                                   style: TextStyle(
                                     fontWeight: FontWeight.bold,
-                                    fontSize: 17,
+                                    fontSize: 18,
+                                    letterSpacing: -0.2,
                                   ),
                                 ),
                                 Text(
@@ -1452,7 +1547,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                         leading: IconButton(
                           icon: const Icon(Icons.arrow_back_rounded),
                           tooltip: 'Back to Library',
-                          onPressed: () => setState(() => _currentDocument = null),
+                          onPressed: _closeDocument,
                         ),
                         title: InkWell(
                           onTap: () => _promptRenameDocument(_currentDocument!),
@@ -1491,7 +1586,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                                   builder: (context, page, _) {
                                     return Text(
                                       _totalPages > 0
-                                          ? 'Page  of  | '
+                                          ? 'Page $page of $_totalPages'
                                           : (_hasLoadError ? 'Error loading' : 'Loading document...'),
                                       style: TextStyle(
                                         fontSize: 12,
@@ -1576,7 +1671,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                                   _resetZoom();
                                   break;
                                 case 'library':
-                                  setState(() => _currentDocument = null);
+                                  _closeDocument();
                                   break;
                               }
                             },
@@ -1730,112 +1825,156 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                           const SizedBox(width: 4),
                         ],
                       ))),
-        body: Stack(
-          children: [
-            // Home library view is kept alive offstage so scroll position is permanently preserved
-            Offstage(
-              offstage: _currentDocument != null,
-              child: TickerMode(
-                enabled: _currentDocument == null,
-                child: _buildHomeDocumentListView(isDark),
-              ),
-            ),
-            if (_currentDocument != null) ...[
-              _buildPdfView(),
-              if (!_isDocumentLoaded && !_hasLoadError)
-                Center(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 18),
-                    decoration: BoxDecoration(
-                      color: isDark ? const Color(0xFF1E293B) : Colors.white,
-                      borderRadius: BorderRadius.circular(16),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.15),
-                          blurRadius: 16,
-                        ),
-                      ],
+        body: _currentDocument == null
+            ? _buildHomeDocumentListView(isDark)
+            : Stack(
+                children: [
+                  _buildPdfView(),
+                  if (!_isDocumentLoaded && !_hasLoadError)
+                    Positioned(
+                      top: 0,
+                      left: 0,
+                      right: 0,
+                      child: LinearProgressIndicator(
+                        minHeight: 3,
+                        backgroundColor: Colors.transparent,
+                        valueColor: AlwaysStoppedAnimation<Color>(theme.colorScheme.primary),
+                      ),
                     ),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        CircularProgressIndicator(
-                          color: theme.colorScheme.primary,
-                          strokeWidth: 3,
-                        ),
-                        const SizedBox(height: 14),
-                        Text(
-                          'Rendering document...',
-                          style: TextStyle(
-                            fontWeight: FontWeight.w600,
-                            color: isDark ? Colors.white70 : Colors.black87,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              if (_hasLoadError)
-                Center(
-                  child: Container(
-                    margin: const EdgeInsets.symmetric(horizontal: 32),
-                    padding: const EdgeInsets.all(24),
-                    decoration: BoxDecoration(
-                      color: isDark ? const Color(0xFF1E293B) : Colors.white,
-                      borderRadius: BorderRadius.circular(16),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.15),
-                          blurRadius: 16,
-                        ),
-                      ],
-                    ),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(
-                          Icons.error_outline_rounded,
-                          color: Colors.redAccent,
-                          size: 48,
-                        ),
-                        const SizedBox(height: 12),
-                        const Text(
-                          'Failed to open document',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        Text(
-                          _loadErrorMessage ?? 'Unknown error occurred',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: 13,
-                            color: isDark ? Colors.white54 : Colors.black54,
-                          ),
-                        ),
-                        const SizedBox(height: 18),
-                        ElevatedButton.icon(
-                          icon: const Icon(Icons.folder_open_rounded, size: 18),
-                          label: const Text('Open Another PDF'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: theme.colorScheme.primary,
-                            foregroundColor: Colors.white,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14),
+                  if (_hasLoadError)
+                    Center(
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(horizontal: 32),
+                        padding: const EdgeInsets.all(24),
+                        decoration: BoxDecoration(
+                          color: isDark ? const Color(0xFF1E293B) : Colors.white,
+                          borderRadius: BorderRadius.circular(16),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.15),
+                              blurRadius: 16,
                             ),
-                          ),
-                          onPressed: _promptPermissionOrPick,
+                          ],
                         ),
-                      ],
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(
+                              Icons.error_outline_rounded,
+                              color: Colors.redAccent,
+                              size: 48,
+                            ),
+                            const SizedBox(height: 12),
+                            const Text(
+                              'Failed to open document',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              _loadErrorMessage ?? 'Unknown error occurred',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: isDark ? Colors.white54 : Colors.black54,
+                              ),
+                            ),
+                            const SizedBox(height: 18),
+                            ElevatedButton.icon(
+                              icon: const Icon(Icons.folder_open_rounded, size: 18),
+                              label: const Text('Open Another PDF'),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: theme.colorScheme.primary,
+                                foregroundColor: Colors.white,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                              ),
+                              onPressed: _promptPermissionOrPick,
+                            ),
+                          ],
+                        ),
+                      ),
                     ),
-                  ),
-                ),
-            ],
-          ],
-        ),
+                ],
+              ),
       ),
     );
+  }
+}
+
+class FastMomentumScrollPhysics extends BouncingScrollPhysics {
+  const FastMomentumScrollPhysics({super.parent, super.decelerationRate});
+
+  @override
+  FastMomentumScrollPhysics applyTo(ScrollPhysics? ancestor) {
+    return FastMomentumScrollPhysics(
+      parent: buildParent(ancestor),
+      decelerationRate: decelerationRate,
+    );
+  }
+
+  @override
+  double get dragStartDistanceMotionThreshold => 3.5;
+
+  @override
+  double get minFlingVelocity => 40.0;
+
+  @override
+  double get maxFlingVelocity => 15000.0;
+
+  @override
+  double carriedMomentum(double existingVelocity) {
+    return existingVelocity.sign *
+        math.min(0.0012 * math.pow(existingVelocity.abs(), 1.95).toDouble(), 6000.0);
+  }
+
+  @override
+  Simulation? createBallisticSimulation(ScrollMetrics position, double velocity) {
+    if (position.outOfRange) {
+      return super.createBallisticSimulation(position, velocity);
+    }
+    final tolerance = toleranceFor(position);
+    if (velocity.abs() < tolerance.velocity) {
+      return null;
+    }
+    return super.createBallisticSimulation(position, velocity * 1.35);
+  }
+}
+
+class _PinnedSearchBarDelegate extends SliverPersistentHeaderDelegate {
+  final Widget child;
+  final double height;
+  final Color backgroundColor;
+
+  _PinnedSearchBarDelegate({
+    required this.child,
+    required this.height,
+    required this.backgroundColor,
+  });
+
+  @override
+  double get minExtent => height;
+
+  @override
+  double get maxExtent => height;
+
+  @override
+  Widget build(BuildContext context, double shrinkOffset, bool overlapsContent) {
+    return Container(
+      color: backgroundColor,
+      padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
+      alignment: Alignment.center,
+      child: child,
+    );
+  }
+
+  @override
+  bool shouldRebuild(covariant _PinnedSearchBarDelegate oldDelegate) {
+    return oldDelegate.child != child ||
+        oldDelegate.height != height ||
+        oldDelegate.backgroundColor != backgroundColor;
   }
 }

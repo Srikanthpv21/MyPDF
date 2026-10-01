@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 import 'package:flutter/foundation.dart';
@@ -11,35 +12,34 @@ class DevicePdfService {
   DevicePdfService._();
   static final DevicePdfService instance = DevicePdfService._();
 
-  /// Picks a PDF file using the system file picker
   Future<PdfDocumentItem?> pickPdfFile() async {
     try {
       final result = await FilePicker.pickFiles(
         type: FileType.custom,
         allowedExtensions: ['pdf'],
-        withData: true,
+        withData: false,
       );
 
       if (result != null && result.files.isNotEmpty) {
         final file = result.files.first;
         final formattedSize = '${(file.size / 1024).toStringAsFixed(1)} KB';
 
-        if (file.bytes != null) {
+        if (file.path != null && file.path!.isNotEmpty) {
+          return PdfDocumentItem(
+            id: file.path!,
+            title: file.name,
+            subtitle: 'Device Storage | $formattedSize',
+            type: PdfSourceType.file,
+            path: file.path!,
+            fileSize: formattedSize,
+          );
+        } else if (file.bytes != null) {
           return PdfDocumentItem(
             id: DateTime.now().millisecondsSinceEpoch.toString(),
             title: file.name,
             subtitle: 'Device Storage | $formattedSize',
             type: PdfSourceType.memory,
             bytes: file.bytes,
-            fileSize: formattedSize,
-          );
-        } else if (file.path != null) {
-          return PdfDocumentItem(
-            id: DateTime.now().millisecondsSinceEpoch.toString(),
-            title: file.name,
-            subtitle: 'Device Storage | $formattedSize',
-            type: PdfSourceType.file,
-            path: file.path!,
             fileSize: formattedSize,
           );
         }
@@ -51,8 +51,6 @@ class DevicePdfService {
     return null;
   }
 
-  /// Renames a PDF file on the device filesystem (if file-backed) or in-memory.
-  /// Throws an [Exception] if validation fails or the operation cannot be completed.
   Future<PdfDocumentItem> renamePdf({
     required PdfDocumentItem doc,
     required String newBaseName,
@@ -83,7 +81,7 @@ class DevicePdfService {
       final newPath = '${parentDir.path}${Platform.pathSeparator}$finalFileName';
 
       if (newPath == oldFile.path) {
-        return doc; // Same name, no-op
+        return doc;
       }
 
       final targetFile = File(newPath);
@@ -95,7 +93,6 @@ class DevicePdfService {
       try {
         renamedFile = await oldFile.rename(newPath);
       } catch (e) {
-        // Fallback: copy and delete if atomic rename syscall fails across storage mounts
         try {
           renamedFile = await oldFile.copy(newPath);
           await oldFile.delete();
@@ -112,7 +109,6 @@ class DevicePdfService {
         path: renamedFile.path,
       );
     } else {
-      // For memory, asset, or network documents: update title in-memory
       return doc.copyWith(
         title: finalFileName,
       );
@@ -173,6 +169,9 @@ class DevicePdfService {
       try {
         if (doc.type == PdfSourceType.file && doc.path.isNotEmpty) {
           final file = File(doc.path);
+          if (!file.path.toLowerCase().endsWith('.pdf')) {
+            continue;
+          }
           if (await file.exists()) {
             await file.delete();
             deletedCount++;
@@ -187,9 +186,102 @@ class DevicePdfService {
     return deletedCount;
   }
 
+  static const String _cacheFileName = 'pdf_library_cache.json';
+  static const String _readingProgressFileName = 'pdf_reading_progress.json';
 
-  /// Scans device storage for PDF documents in common public directories
-  /// using a background isolate so the UI thread never freezes.
+  String? _cachedAppDocPath;
+  String? _lastSavedCacheContent;
+  String? _lastSavedProgressContent;
+
+  Future<String> _getAppDocPath() async {
+    if (_cachedAppDocPath != null) return _cachedAppDocPath!;
+    final dir = await getApplicationDocumentsDirectory();
+    _cachedAppDocPath = dir.path;
+    return _cachedAppDocPath!;
+  }
+
+  Future<File> _getCacheFile() async {
+    final path = await _getAppDocPath();
+    return File('$path/$_cacheFileName');
+  }
+
+  Future<List<PdfDocumentItem>> loadCachedPdfs() async {
+    try {
+      final file = await _getCacheFile();
+      if (await file.exists()) {
+        final content = await file.readAsString();
+        if (content.isNotEmpty) {
+          _lastSavedCacheContent = content;
+          final List<dynamic> list = jsonDecode(content);
+          final items = <PdfDocumentItem>[];
+          for (final raw in list) {
+            try {
+              if (raw is Map<String, dynamic>) {
+                final doc = PdfDocumentItem.fromJson(raw);
+                if (doc.path.isNotEmpty && File(doc.path).existsSync()) {
+                  items.add(doc);
+                }
+              }
+            } catch (_) {}
+          }
+          return items;
+        }
+      }
+    } catch (e) {
+      debugPrint('Error loading cached PDFs: $e');
+    }
+    return [];
+  }
+
+  Future<void> saveCachedPdfs(List<PdfDocumentItem> pdfs) async {
+    try {
+      final jsonList = pdfs.where((d) => d.type == PdfSourceType.file).map((d) => d.toJson()).toList();
+      final content = jsonEncode(jsonList);
+      if (content == _lastSavedCacheContent) return;
+      _lastSavedCacheContent = content;
+
+      final file = await _getCacheFile();
+      await file.writeAsString(content);
+    } catch (e) {
+      debugPrint('Error saving cached PDFs: $e');
+    }
+  }
+
+  Future<File> _getReadingProgressFile() async {
+    final path = await _getAppDocPath();
+    return File('$path/$_readingProgressFileName');
+  }
+
+  Future<Map<String, int>> loadReadingProgress() async {
+    try {
+      final file = await _getReadingProgressFile();
+      if (await file.exists()) {
+        final content = await file.readAsString();
+        if (content.isNotEmpty) {
+          _lastSavedProgressContent = content;
+          final Map<String, dynamic> raw = jsonDecode(content);
+          return raw.map((k, v) => MapEntry(k, v is int ? v : int.tryParse(v.toString()) ?? 1));
+        }
+      }
+    } catch (e) {
+      debugPrint('Error loading reading progress: $e');
+    }
+    return {};
+  }
+
+  Future<void> saveReadingProgress(Map<String, int> progress) async {
+    try {
+      final content = jsonEncode(progress);
+      if (content == _lastSavedProgressContent) return;
+      _lastSavedProgressContent = content;
+
+      final file = await _getReadingProgressFile();
+      await file.writeAsString(content);
+    } catch (e) {
+      debugPrint('Error saving reading progress: $e');
+    }
+  }
+
   Future<List<PdfDocumentItem>> scanCommonPdfDirectories() async {
     if (kIsWeb || !Platform.isAndroid) return [];
 
@@ -213,12 +305,10 @@ class DevicePdfService {
       Directory('/storage/emulated/0/Download'),
       Directory('/storage/emulated/0/Documents'),
       Directory('/storage/emulated/0/Books'),
-      Directory('/storage/emulated/0/DCIM'),
       Directory('/storage/emulated/0/WhatsApp/Media/WhatsApp Documents'),
       Directory('/storage/emulated/0/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Documents'),
     ];
 
-    // Check for SD card or external secondary storage mounts
     try {
       final storageDir = Directory('/storage');
       if (storageDir.existsSync()) {
@@ -246,7 +336,7 @@ class DevicePdfService {
         for (final entity in entities) {
           final segments = entity.uri.pathSegments.where((s) => s.isNotEmpty).toList();
           final name = segments.isNotEmpty ? segments.last : '';
-          if (name.startsWith('.')) continue; // ignore hidden files/folders
+          if (name.startsWith('.')) continue;
 
           if (entity is File && entity.path.toLowerCase().endsWith('.pdf')) {
             if (visitedFilePaths.add(entity.path)) {
@@ -273,8 +363,12 @@ class DevicePdfService {
             }
           } else if (entity is Directory && currentDepth < maxDepth) {
             final path = entity.path;
-            // Never enter restricted Android system app/data directories
-            if (path.contains('/Android/data') || path.contains('/Android/obb')) {
+            if (path.contains('/Android/data') ||
+                path.contains('/Android/obb') ||
+                path.contains('/DCIM') ||
+                path.contains('/Pictures') ||
+                path.contains('/Music') ||
+                path.contains('/Movies')) {
               continue;
             }
             scanDirectory(entity, currentDepth + 1, maxDepth);
@@ -289,39 +383,6 @@ class DevicePdfService {
       scanDirectory(dir, 0, 2);
     }
 
-    // Scan root storage at depth 0 only (files directly in /storage/emulated/0, without re-scanning subfolders)
-    try {
-      final rootDir = Directory('/storage/emulated/0');
-      if (rootDir.existsSync()) {
-        final rootEntries = rootDir.listSync(followLinks: false);
-        for (final entity in rootEntries) {
-          if (entity is File && entity.path.toLowerCase().endsWith('.pdf')) {
-            if (visitedFilePaths.add(entity.path)) {
-              try {
-                final stat = entity.statSync();
-                final sizeInBytes = stat.size;
-                final formattedSize = sizeInBytes >= 1024 * 1024
-                    ? '${(sizeInBytes / (1024 * 1024)).toStringAsFixed(1)} MB'
-                    : '${(sizeInBytes / 1024).toStringAsFixed(1)} KB';
-                results.add(
-                  PdfDocumentItem(
-                    id: entity.path,
-                    title: entity.uri.pathSegments.lastWhere((s) => s.isNotEmpty, orElse: () => 'document.pdf'),
-                    subtitle: 'Storage | $formattedSize',
-                    type: PdfSourceType.file,
-                    path: entity.path,
-                    fileSize: formattedSize,
-                    lastModified: stat.modified,
-                  ),
-                );
-              } catch (_) {}
-            }
-          }
-        }
-      }
-    } catch (_) {}
-
-    // Sort newest modified first
     results.sort((a, b) {
       if (a.lastModified != null && b.lastModified != null) {
         return b.lastModified!.compareTo(a.lastModified!);

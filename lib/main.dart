@@ -6,7 +6,6 @@ import 'theme/app_theme.dart';
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Set immersive system status and navigation bar styling for mobile
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
       statusBarColor: Colors.transparent,
@@ -29,7 +28,7 @@ class MobilePdfViewerApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: AppTheme.lightTheme,
       darkTheme: AppTheme.darkTheme,
-      themeMode: ThemeMode.dark, // Default to sleek modern dark mode
+      themeMode: ThemeMode.system,
       home: const PdfViewerScreen(),
     );
   }

@@ -28,15 +28,12 @@ class _PageThumbnailSheetState extends State<PageThumbnailSheet> {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
 
-    final displayedPages = List.generate(
-      widget.totalPages,
-      (index) => index + 1,
-    ).where((p) {
-      if (_filterBookmarkedOnly) {
-        return widget.bookmarkedPages.contains(p);
-      }
-      return true;
-    }).toList();
+    final List<int>? bookmarkedList = _filterBookmarkedOnly
+        ? (widget.bookmarkedPages.toList()..sort())
+        : null;
+    final totalItemCount = _filterBookmarkedOnly
+        ? (bookmarkedList?.length ?? 0)
+        : widget.totalPages;
 
     return Container(
       constraints: BoxConstraints(
@@ -86,6 +83,7 @@ class _PageThumbnailSheetState extends State<PageThumbnailSheet> {
                     fontSize: 18,
                   ),
                 ),
+                
                 const Spacer(),
                 FilterChip(
                   avatar: Icon(
@@ -125,7 +123,7 @@ class _PageThumbnailSheetState extends State<PageThumbnailSheet> {
           const Divider(height: 20),
 
           Expanded(
-            child: displayedPages.isEmpty
+            child: totalItemCount == 0
                 ? Center(
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
@@ -163,9 +161,9 @@ class _PageThumbnailSheetState extends State<PageThumbnailSheet> {
                       mainAxisSpacing: 16,
                       childAspectRatio: 0.72,
                     ),
-                    itemCount: displayedPages.length,
+                    itemCount: totalItemCount,
                     itemBuilder: (context, index) {
-                      final pageNum = displayedPages[index];
+                      final pageNum = _filterBookmarkedOnly ? bookmarkedList![index] : index + 1;
                       final isCurrent = pageNum == widget.currentPage;
                       final isBookmarked = widget.bookmarkedPages.contains(pageNum);
 
@@ -175,8 +173,7 @@ class _PageThumbnailSheetState extends State<PageThumbnailSheet> {
                           widget.onPageSelected(pageNum);
                         },
                         borderRadius: BorderRadius.circular(14),
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 200),
+                        child: Container(
                           decoration: BoxDecoration(
                             color: isDark ? const Color(0xFF1E293B) : const Color(0xFFF8FAFC),
                             borderRadius: BorderRadius.circular(14),
@@ -267,6 +264,7 @@ class _PageThumbnailSheetState extends State<PageThumbnailSheet> {
                                 top: 4,
                                 right: 4,
                                 child: GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
                                   onTap: () => widget.onBookmarkToggled(pageNum),
                                   child: Container(
                                     padding: const EdgeInsets.all(4),
