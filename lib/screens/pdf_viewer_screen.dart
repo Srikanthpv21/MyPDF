@@ -12,6 +12,9 @@ import '../widgets/page_thumbnail_sheet.dart';
 import '../widgets/rename_pdf_dialog.dart';
 import '../widgets/search_bar_overlay.dart';
 import '../widgets/storage_permission_dialog.dart';
+import 'viewers/excel_viewer_screen.dart';
+import 'viewers/word_viewer_screen.dart';
+import 'viewers/ppt_viewer_screen.dart';
 
 class PdfViewerScreen extends StatefulWidget {
   final PdfDocumentItem? initialDocument;
@@ -59,6 +62,30 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
   final ScrollController _homeScrollController = ScrollController();
   final Set<String> _selectedDocumentIds = {};
   bool get _isSelectionMode => _selectedDocumentIds.isNotEmpty;
+  bool _isScrolledPastSearchBar = false;
+  bool _isHomeAppBarSearchOpen = false;
+  final FocusNode _homeAppBarSearchFocusNode = FocusNode();
+  DocumentCategory _selectedCategory = DocumentCategory.all;
+
+  int get _pdfCount => _devicePdfs.where((d) => d.category == DocumentCategory.pdf).length;
+  int get _wordCount => _devicePdfs.where((d) => d.category == DocumentCategory.word).length;
+  int get _excelCount => _devicePdfs.where((d) => d.category == DocumentCategory.excel).length;
+  int get _pptCount => _devicePdfs.where((d) => d.category == DocumentCategory.ppt).length;
+
+  Color get _selectedCategoryColor {
+    switch (_selectedCategory) {
+      case DocumentCategory.pdf:
+        return const Color(0xFFEF4444);
+      case DocumentCategory.word:
+        return const Color(0xFF2563EB);
+      case DocumentCategory.excel:
+        return const Color(0xFF16A34A);
+      case DocumentCategory.ppt:
+        return const Color(0xFFEA580C);
+      case DocumentCategory.all:
+        return const Color(0xFF6366F1);
+    }
+  }
 
   final ValueNotifier<int> _currentPageNotifier = ValueNotifier<int>(1);
   DateTime _lastTapTime = DateTime.fromMillisecondsSinceEpoch(0);
@@ -70,19 +97,32 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
 
   void _updateFilteredDocs() {
     final query = _homeSearchFilter.trim().toLowerCase();
-    if (query.isEmpty) {
-      _filteredDocs = List.unmodifiable(_devicePdfs);
-    } else {
-      _filteredDocs = _devicePdfs.where((doc) => doc.matchesQuery(query)).toList();
+    Iterable<PdfDocumentItem> docs = _devicePdfs;
+    if (_selectedCategory != DocumentCategory.all) {
+      docs = docs.where((doc) => doc.category == _selectedCategory);
     }
+    if (query.isNotEmpty) {
+      docs = docs.where((doc) => doc.matchesQuery(query));
+    }
+    _filteredDocs = docs.toList();
   }
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _pdfViewerController = PdfViewerController();
-    _currentDocument = widget.initialDocument;
+    _homeScrollController.addListener(_onHomeScroll);
+    final initialDoc = widget.initialDocument;
+    if (initialDoc != null && initialDoc.category != DocumentCategory.pdf) {
+      _currentDocument = null;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _openDocument(initialDoc);
+        }
+      });
+    } else {
+      _currentDocument = initialDoc;
+    }
     _totalPages = _currentDocument?.pageCount ?? 0;
     _currentPageNotifier.value = _currentPage;
     _updateFilteredDocs();
@@ -117,8 +157,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
   }
 
   void _openDocumentFromPath(String path) {
-    if (!path.toLowerCase().endsWith('.pdf')) {
-      debugPrint('Security warning: Refused to open non-PDF file: $path');
+    if (!DevicePdfService.isSupportedFile(path)) {
+      debugPrint('Security warning: Refused to open unsupported file: $path');
       return;
     }
     final file = File(path);
@@ -171,10 +211,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
 
   @override
   void dispose() {
+    _homeScrollController.removeListener(_onHomeScroll);
     _searchDebounceTimer?.cancel();
     _homeSearchDebounceTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _currentPageNotifier.dispose();
+    _homeAppBarSearchFocusNode.dispose();
     _homeScrollController.dispose();
     _homeSearchController.dispose();
     _searchResult?.removeListener(_onSearchResultChanged);
@@ -341,6 +383,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
   }
 
   void _openDocument(PdfDocumentItem doc) {
+    _homeAppBarSearchFocusNode.unfocus();
+    _isHomeAppBarSearchOpen = false;
     if (_isSelectionMode) {
       _toggleSelect(doc);
       return;
@@ -351,6 +395,29 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
       return;
     }
     _lastDocumentOpenTime = now;
+
+    if (doc.category == DocumentCategory.excel) {
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => ExcelViewerScreen(document: doc),
+        ),
+      );
+      return;
+    } else if (doc.category == DocumentCategory.word) {
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => WordViewerScreen(document: doc),
+        ),
+      );
+      return;
+    } else if (doc.category == DocumentCategory.ppt) {
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => PptViewerScreen(document: doc),
+        ),
+      );
+      return;
+    }
 
     _searchResult?.removeListener(_onSearchResultChanged);
     _searchResult?.clear();
@@ -484,7 +551,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
               const SizedBox(width: 12),
               Expanded(
                 child: Text(
-                  count == 1 ? 'Delete PDF?' : 'Delete $count PDFs?',
+                  count == 1 ? 'Delete Document?' : 'Delete $count Documents?',
                   style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                 ),
               ),
@@ -732,6 +799,39 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
     }
   }
 
+  void _onHomeScroll() {
+    if (!_homeScrollController.hasClients) return;
+    final isScrolled = _homeScrollController.offset > 40;
+    if (isScrolled != _isScrolledPastSearchBar) {
+      setState(() {
+        _isScrolledPastSearchBar = isScrolled;
+        if (!isScrolled && _isHomeAppBarSearchOpen && _homeSearchFilter.isEmpty) {
+          _isHomeAppBarSearchOpen = false;
+        }
+      });
+    }
+  }
+
+  void _openHomeSearch() {
+    setState(() {
+      _isHomeAppBarSearchOpen = true;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _homeAppBarSearchFocusNode.requestFocus();
+      }
+    });
+  }
+
+  void _closeHomeSearch() {
+    _homeAppBarSearchFocusNode.unfocus();
+    setState(() {
+      _isHomeAppBarSearchOpen = false;
+      _homeSearchController.clear();
+      _onHomeSearchChanged('');
+    });
+  }
+
   void _zoomIn() {
     setState(() {
       _zoomLevel = (_zoomLevel + 0.25).clamp(1.0, 4.0);
@@ -761,18 +861,15 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
 
     final filteredDocs = _filteredDocs;
 
-    return RefreshIndicator(
-      onRefresh: _scanAndLoadDevicePdfs,
-      color: primaryColor,
-      child: Scrollbar(
+    return Scrollbar(
+      controller: _homeScrollController,
+      interactive: true,
+      thickness: 6.0,
+      radius: const Radius.circular(8),
+      child: CustomScrollView(
+        key: const PageStorageKey<String>('home_pdf_library_scroll'),
         controller: _homeScrollController,
-        interactive: true,
-        thickness: 6.0,
-        radius: const Radius.circular(8),
-        child: CustomScrollView(
-          key: const PageStorageKey<String>('home_pdf_library_scroll'),
-          controller: _homeScrollController,
-          physics: const FastMomentumScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+        physics: const FastMomentumScrollPhysics(),
           slivers: [
           if (!_hasStoragePermission)
             SliverToBoxAdapter(
@@ -833,7 +930,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
             ),
 
           SliverPersistentHeader(
-            pinned: true,
+            pinned: false,
             delegate: _PinnedSearchBarDelegate(
               height: 68.0,
               backgroundColor: _canvasBackgroundColor(isDark),
@@ -890,7 +987,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
               child: Row(
                 children: [
                   Text(
-                    'PDF DOCUMENTS',
+                    switch (_selectedCategory) {
+                      DocumentCategory.all => 'ALL DOCUMENTS',
+                      DocumentCategory.pdf => 'PDF DOCUMENTS',
+                      DocumentCategory.word => 'WORD DOCUMENTS',
+                      DocumentCategory.excel => 'EXCEL SPREADSHEETS',
+                      DocumentCategory.ppt => 'POWERPOINT DECKS',
+                    },
                     style: TextStyle(
                       fontSize: 11.5,
                       fontWeight: FontWeight.w700,
@@ -902,7 +1005,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                     decoration: BoxDecoration(
-                      color: primaryColor.withValues(alpha: 0.15),
+                      color: (_selectedCategory == DocumentCategory.all ? primaryColor : _selectedCategoryColor)
+                          .withValues(alpha: 0.15),
                       borderRadius: BorderRadius.circular(10),
                     ),
                     child: Text(
@@ -910,7 +1014,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                       style: TextStyle(
                         fontSize: 11,
                         fontWeight: FontWeight.bold,
-                        color: primaryColor,
+                        color: _selectedCategory == DocumentCategory.all ? primaryColor : _selectedCategoryColor,
                       ),
                     ),
                   ),
@@ -1055,7 +1159,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                     final doc = filteredDocs[index];
                     final isSelected = _selectedDocumentIds.contains(doc.id);
                     final savedPage = _readingProgress[doc.id] ?? 1;
-                    final hasProgress = savedPage > 1;
+                    final hasProgress = savedPage > 1 && doc.category == DocumentCategory.pdf;
+                    final docColor = doc.categoryColor;
+                    final docIcon = doc.categoryIcon;
 
                     return Padding(
                       padding: const EdgeInsets.only(bottom: 10),
@@ -1103,7 +1209,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                                       ? primaryColor
                                       : (_isSelectionMode
                                           ? (isDark ? const Color(0xFF334155) : const Color(0xFFE2E8F0))
-                                          : primaryColor.withValues(alpha: 0.12)),
+                                          : docColor.withValues(alpha: 0.12)),
                                   borderRadius: BorderRadius.circular(12),
                                 ),
                                 child: Center(
@@ -1114,8 +1220,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                                           size: 22,
                                         )
                                       : Icon(
-                                          Icons.picture_as_pdf_rounded,
-                                          color: primaryColor,
+                                          docIcon,
+                                          color: docColor,
                                           size: 24,
                                         ),
                                 ),
@@ -1140,6 +1246,22 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                                     const SizedBox(height: 3),
                                     Row(
                                       children: [
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                                          margin: const EdgeInsets.only(right: 6),
+                                          decoration: BoxDecoration(
+                                            color: docColor.withValues(alpha: 0.12),
+                                            borderRadius: BorderRadius.circular(4),
+                                          ),
+                                          child: Text(
+                                            doc.fileExtension,
+                                            style: TextStyle(
+                                              fontSize: 9.5,
+                                              fontWeight: FontWeight.w800,
+                                              color: docColor,
+                                            ),
+                                          ),
+                                        ),
                                         Flexible(
                                           child: Text(
                                             doc.subtitle,
@@ -1235,7 +1357,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                                         children: [
                                           Icon(Icons.drive_file_rename_outline_rounded, size: 18, color: Colors.blueAccent),
                                           SizedBox(width: 10),
-                                          Text('Rename PDF'),
+                                          Text('Rename'),
                                         ],
                                       ),
                                     ),
@@ -1245,7 +1367,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                                         children: [
                                           Icon(Icons.share_rounded, size: 18, color: Colors.teal),
                                           SizedBox(width: 10),
-                                          Text('Share PDF'),
+                                          Text('Share'),
                                         ],
                                       ),
                                     ),
@@ -1274,8 +1396,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
             ),
         ],
         ),
-      ),
-    );
+      );
   }
 
   void _onViewerTap(PdfGestureDetails details) {
@@ -1370,11 +1491,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
     final barBg = isDark ? const Color(0xFF151C2C) : Colors.white;
 
     return PopScope(
-      canPop: !_isSearchOpen && !_isFullScreen && _currentDocument == null && !_isSelectionMode,
+      canPop: !_isSearchOpen && !_isFullScreen && _currentDocument == null && !_isSelectionMode && !_isHomeAppBarSearchOpen,
       onPopInvokedWithResult: (didPop, result) {
         if (didPop) return;
         if (_isSelectionMode) {
           _clearSelection();
+        } else if (_isHomeAppBarSearchOpen) {
+          _closeHomeSearch();
         } else if (_isSearchOpen) {
           _closeSearch();
         } else if (_isFullScreen) {
@@ -1461,78 +1584,159 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                               const SizedBox(width: 4),
                             ],
                           )
-                        : AppBar(
-                            backgroundColor: barBg,
-                            elevation: 0,
-                            scrolledUnderElevation: 0,
-                            bottom: PreferredSize(
-                              preferredSize: const Size.fromHeight(1),
-                              child: Container(
-                                height: 1,
-                                color: borderColor,
-                              ),
-                            ),
-                            leading: Padding(
-                              padding: const EdgeInsets.only(left: 14),
-                              child: Center(
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(8),
-                                  child: Image.asset(
-                                    'assets/icon/app_logo.png',
-                                    width: 32,
-                                    height: 32,
-                                    cacheWidth: 64,
-                                    cacheHeight: 64,
-                                    fit: BoxFit.contain,
+                        : _isHomeAppBarSearchOpen
+                            ? AppBar(
+                                backgroundColor: barBg,
+                                elevation: 0,
+                                scrolledUnderElevation: 0,
+                                bottom: PreferredSize(
+                                  preferredSize: const Size.fromHeight(1),
+                                  child: Container(
+                                    height: 1,
+                                    color: borderColor,
                                   ),
                                 ),
-                              ),
-                            ),
-                            title: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                const Text(
-                                  'MYPDF',
-                                  style: TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 18,
-                                    letterSpacing: -0.2,
+                                leading: IconButton(
+                                  icon: const Icon(Icons.arrow_back_rounded),
+                                  tooltip: 'Close Search',
+                                  onPressed: _closeHomeSearch,
+                                ),
+                                titleSpacing: 0,
+                                title: Container(
+                                  height: 42,
+                                  margin: const EdgeInsets.only(right: 8),
+                                  decoration: BoxDecoration(
+                                    color: isDark ? const Color(0xFF1E293B) : const Color(0xFFF1F5F9),
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(
+                                      color: isDark ? const Color(0xFF334155) : const Color(0xFFCBD5E1),
+                                    ),
+                                  ),
+                                  child: TextField(
+                                    controller: _homeSearchController,
+                                    focusNode: _homeAppBarSearchFocusNode,
+                                    autofocus: true,
+                                    onChanged: _onHomeSearchChanged,
+                                    style: TextStyle(
+                                      fontSize: 14,
+                                      color: isDark ? Colors.white : const Color(0xFF0F172A),
+                                    ),
+                                    decoration: InputDecoration(
+                                      hintText: 'Search PDF documents...',
+                                      hintStyle: TextStyle(
+                                        color: isDark ? Colors.white38 : const Color(0xFF94A3B8),
+                                        fontSize: 13.5,
+                                      ),
+                                      border: InputBorder.none,
+                                      isDense: true,
+                                      contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                                      prefixIcon: Icon(
+                                        Icons.search_rounded,
+                                        size: 18,
+                                        color: isDark ? Colors.white54 : const Color(0xFF64748B),
+                                      ),
+                                      prefixIconConstraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                                      suffixIcon: _homeSearchFilter.isNotEmpty
+                                          ? IconButton(
+                                              padding: EdgeInsets.zero,
+                                              icon: const Icon(Icons.clear_rounded, size: 16),
+                                              tooltip: 'Clear',
+                                              onPressed: () {
+                                                _homeSearchController.clear();
+                                                _onHomeSearchChanged('');
+                                              },
+                                            )
+                                          : null,
+                                    ),
                                   ),
                                 ),
-                                Text(
-                                  _isScanningDevicePdfs
-                                      ? 'Scanning device storage...'
-                                      : (_hasStoragePermission
-                                          ? '${_devicePdfs.length} PDFs on Device'
-                                          : 'Storage access required'),
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    color: isDark ? Colors.white54 : const Color(0xFF64748B),
+                                actions: [
+                                  IconButton(
+                                    icon: const Icon(Icons.close_rounded),
+                                    tooltip: 'Close Search',
+                                    onPressed: _closeHomeSearch,
+                                  ),
+                                  const SizedBox(width: 4),
+                                ],
+                              )
+                            : AppBar(
+                                backgroundColor: barBg,
+                                elevation: 0,
+                                scrolledUnderElevation: 0,
+                                bottom: PreferredSize(
+                                  preferredSize: const Size.fromHeight(1),
+                                  child: Container(
+                                    height: 1,
+                                    color: borderColor,
                                   ),
                                 ),
-                              ],
-                            ),
-                            actions: [
-                              IconButton(
-                                icon: _isScanningDevicePdfs
-                                    ? const SizedBox(
-                                        width: 18,
-                                        height: 18,
-                                        child: CircularProgressIndicator(strokeWidth: 2),
-                                      )
-                                    : const Icon(Icons.refresh_rounded),
-                                tooltip: 'Scan Storage for PDFs',
-                                onPressed: _isScanningDevicePdfs ? null : _scanAndLoadDevicePdfs,
-                              ),
-                              IconButton(
-                                icon: const Icon(Icons.folder_open_rounded),
-                                tooltip: 'Browse Any PDF',
-                                onPressed: _pickAndOpenDevicePdf,
-                              ),
-                              const SizedBox(width: 4),
-                            ],
-                          ))
+                                leading: Padding(
+                                  padding: const EdgeInsets.only(left: 14),
+                                  child: Center(
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(8),
+                                      child: Image.asset(
+                                        'assets/icon/app_logo.png',
+                                        width: 32,
+                                        height: 32,
+                                        cacheWidth: 64,
+                                        cacheHeight: 64,
+                                        fit: BoxFit.contain,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                title: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Text(
+                                      'MYPDF',
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 18,
+                                        letterSpacing: -0.2,
+                                      ),
+                                    ),
+                                    Text(
+                                      _isScanningDevicePdfs
+                                          ? 'Scanning device storage...'
+                                          : (_hasStoragePermission
+                                              ? '${_devicePdfs.length} Files on Device'
+                                              : 'Storage access required'),
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: isDark ? Colors.white54 : const Color(0xFF64748B),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                actions: [
+                                  if (_isScrolledPastSearchBar)
+                                    IconButton(
+                                      icon: const Icon(Icons.search_rounded),
+                                      tooltip: 'Search PDFs',
+                                      onPressed: _openHomeSearch,
+                                    ),
+                                  IconButton(
+                                    icon: _isScanningDevicePdfs
+                                        ? const SizedBox(
+                                            width: 18,
+                                            height: 18,
+                                            child: CircularProgressIndicator(strokeWidth: 2),
+                                          )
+                                        : const Icon(Icons.refresh_rounded),
+                                    tooltip: 'Scan Storage for PDFs',
+                                    onPressed: _isScanningDevicePdfs ? null : _scanAndLoadDevicePdfs,
+                                  ),
+                                  IconButton(
+                                    icon: const Icon(Icons.folder_open_rounded),
+                                    tooltip: 'Browse Any PDF',
+                                    onPressed: _pickAndOpenDevicePdf,
+                                  ),
+                                  const SizedBox(width: 4),
+                                ],
+                              ))
                     : AppBar(
                         backgroundColor: barBg,
                         elevation: 0,
@@ -1900,6 +2104,96 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> with WidgetsBindingOb
                     ),
                 ],
               ),
+        bottomNavigationBar: _currentDocument == null && !_isFullScreen && !_isSelectionMode
+            ? _buildBottomNavigationBar(isDark)
+            : null,
+      ),
+    );
+  }
+
+  Widget _buildBottomNavigationBar(bool isDark) {
+    final cardBg = isDark ? const Color(0xFF151C2C) : Colors.white;
+    final borderColor = isDark ? const Color(0xFF334155) : const Color(0xFFE2E8F0);
+
+    final tabs = [
+      (DocumentCategory.all, 'All', Icons.folder_copy_rounded, _devicePdfs.length, const Color(0xFF6366F1)),
+      (DocumentCategory.pdf, 'PDF', Icons.picture_as_pdf_rounded, _pdfCount, const Color(0xFFEF4444)),
+      (DocumentCategory.word, 'Word', Icons.description_rounded, _wordCount, const Color(0xFF2563EB)),
+      (DocumentCategory.excel, 'Excel', Icons.table_chart_rounded, _excelCount, const Color(0xFF16A34A)),
+      (DocumentCategory.ppt, 'PPT', Icons.slideshow_rounded, _pptCount, const Color(0xFFEA580C)),
+    ];
+
+    return Container(
+      decoration: BoxDecoration(
+        color: cardBg,
+        border: Border(top: BorderSide(color: borderColor, width: 0.8)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: isDark ? 0.25 : 0.04),
+            blurRadius: 10,
+            offset: const Offset(0, -2),
+          ),
+        ],
+      ),
+      child: SafeArea(
+        top: false,
+        child: SizedBox(
+          height: 60,
+          child: Row(
+            children: tabs.map((tab) {
+              final cat = tab.$1;
+              final label = tab.$2;
+              final icon = tab.$3;
+              final count = tab.$4;
+              final color = tab.$5;
+              final isSelected = _selectedCategory == cat;
+
+              return Expanded(
+                child: InkWell(
+                  onTap: () {
+                    HapticFeedback.selectionClick();
+                    setState(() {
+                      _selectedCategory = cat;
+                      _updateFilteredDocs();
+                    });
+                  },
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Badge(
+                        isLabelVisible: count > 0,
+                        backgroundColor: isSelected ? color : (isDark ? const Color(0xFF334155) : const Color(0xFFCBD5E1)),
+                        textColor: isSelected ? Colors.white : (isDark ? Colors.white70 : const Color(0xFF334155)),
+                        label: Text(
+                          '$count',
+                          style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
+                        ),
+                        child: Icon(
+                          icon,
+                          size: 22,
+                          color: isSelected
+                              ? color
+                              : (isDark ? Colors.white54 : const Color(0xFF94A3B8)),
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        label,
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                          color: isSelected
+                              ? color
+                              : (isDark ? Colors.white54 : const Color(0xFF64748B)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        ),
       ),
     );
   }

@@ -53,6 +53,48 @@ void main() {
     expect(item.type, equals(PdfSourceType.file));
   });
 
+  test('PdfDocumentItem correctly identifies Word, Excel, PPT, and PDF categories', () {
+    final pdfDoc = PdfDocumentItem(
+      id: '1',
+      title: 'Report.pdf',
+      subtitle: 'Downloads',
+      type: PdfSourceType.file,
+      path: '/path/Report.pdf',
+    );
+    expect(pdfDoc.category, equals(DocumentCategory.pdf));
+    expect(pdfDoc.fileExtension, equals('PDF'));
+
+    final wordDoc = PdfDocumentItem(
+      id: '2',
+      title: 'Resume.docx',
+      subtitle: 'Documents',
+      type: PdfSourceType.file,
+      path: '/path/Resume.docx',
+    );
+    expect(wordDoc.category, equals(DocumentCategory.word));
+    expect(wordDoc.fileExtension, equals('DOCX'));
+
+    final excelDoc = PdfDocumentItem(
+      id: '3',
+      title: 'Budget.xlsx',
+      subtitle: 'Downloads',
+      type: PdfSourceType.file,
+      path: '/path/Budget.xlsx',
+    );
+    expect(excelDoc.category, equals(DocumentCategory.excel));
+    expect(excelDoc.fileExtension, equals('XLSX'));
+
+    final pptDoc = PdfDocumentItem(
+      id: '4',
+      title: 'Slides.pptx',
+      subtitle: 'Documents',
+      type: PdfSourceType.file,
+      path: '/path/Slides.pptx',
+    );
+    expect(pptDoc.category, equals(DocumentCategory.ppt));
+    expect(pptDoc.fileExtension, equals('PPTX'));
+  });
+
   test('PdfDocumentItem copyWith works accurately', () {
     final original = PdfDocumentItem(
       id: 'doc1',

@@ -30,12 +30,22 @@ class _RenamePdfDialogState extends State<RenamePdfDialog> {
   String? _errorText;
   bool _isRenaming = false;
 
+  String get _fileExtension {
+    final title = widget.document.title;
+    final dot = title.lastIndexOf('.');
+    if (dot != -1) {
+      return title.substring(dot);
+    }
+    return '.${widget.document.fileExtension.toLowerCase()}';
+  }
+
   @override
   void initState() {
     super.initState();
+    final ext = _fileExtension;
     String baseName = widget.document.title;
-    if (baseName.toLowerCase().endsWith('.pdf')) {
-      baseName = baseName.substring(0, baseName.length - 4);
+    if (baseName.toLowerCase().endsWith(ext.toLowerCase())) {
+      baseName = baseName.substring(0, baseName.length - ext.length);
     }
     _controller = TextEditingController(text: baseName);
     _controller.selection = TextSelection(baseOffset: 0, extentOffset: baseName.length);
@@ -63,9 +73,9 @@ class _RenamePdfDialogState extends State<RenamePdfDialog> {
       try {
         final oldFile = File(widget.document.path);
         final parentDir = oldFile.parent.path;
-        final targetPath = '$parentDir${Platform.pathSeparator}$trimmed.pdf';
+        final targetPath = '$parentDir${Platform.pathSeparator}$trimmed$_fileExtension';
         if (targetPath.toLowerCase() != oldFile.path.toLowerCase() && File(targetPath).existsSync()) {
-          return 'A file named "$trimmed.pdf" already exists';
+          return 'A file named "$trimmed$_fileExtension" already exists';
         }
       } catch (_) {}
     }
@@ -81,9 +91,10 @@ class _RenamePdfDialogState extends State<RenamePdfDialog> {
       return;
     }
 
+    final ext = _fileExtension;
     String currentBase = widget.document.title;
-    if (currentBase.toLowerCase().endsWith('.pdf')) {
-      currentBase = currentBase.substring(0, currentBase.length - 4);
+    if (currentBase.toLowerCase().endsWith(ext.toLowerCase())) {
+      currentBase = currentBase.substring(0, currentBase.length - ext.length);
     }
 
     // If identical, simply dismiss
@@ -157,7 +168,7 @@ class _RenamePdfDialogState extends State<RenamePdfDialog> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Rename PDF',
+                        'Rename Document',
                         style: TextStyle(
                           fontSize: 18,
                           fontWeight: FontWeight.bold,
@@ -227,7 +238,7 @@ class _RenamePdfDialogState extends State<RenamePdfDialog> {
                           borderRadius: BorderRadius.circular(6),
                         ),
                         child: Text(
-                          '.pdf',
+                          _fileExtension,
                           style: TextStyle(
                             fontSize: 12,
                             fontWeight: FontWeight.w700,

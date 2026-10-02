@@ -12,11 +12,30 @@ class DevicePdfService {
   DevicePdfService._();
   static final DevicePdfService instance = DevicePdfService._();
 
+  static const List<String> supportedExtensions = [
+    'pdf',
+    'docx',
+    'doc',
+    'xlsx',
+    'xls',
+    'csv',
+    'pptx',
+    'ppt',
+  ];
+
+  static bool isSupportedFile(String path) {
+    final lower = path.toLowerCase();
+    for (final ext in supportedExtensions) {
+      if (lower.endsWith('.$ext')) return true;
+    }
+    return false;
+  }
+
   Future<PdfDocumentItem?> pickPdfFile() async {
     try {
       final result = await FilePicker.pickFiles(
         type: FileType.custom,
-        allowedExtensions: ['pdf'],
+        allowedExtensions: supportedExtensions,
         withData: false,
       );
 
@@ -55,9 +74,15 @@ class DevicePdfService {
     required PdfDocumentItem doc,
     required String newBaseName,
   }) async {
+    String ext = '.pdf';
+    final dotIndex = doc.title.lastIndexOf('.');
+    if (dotIndex != -1) {
+      ext = doc.title.substring(dotIndex);
+    }
+
     String cleanBaseName = newBaseName.trim();
-    if (cleanBaseName.toLowerCase().endsWith('.pdf')) {
-      cleanBaseName = cleanBaseName.substring(0, cleanBaseName.length - 4).trim();
+    if (cleanBaseName.toLowerCase().endsWith(ext.toLowerCase())) {
+      cleanBaseName = cleanBaseName.substring(0, cleanBaseName.length - ext.length).trim();
     }
 
     if (cleanBaseName.isEmpty) {
@@ -69,7 +94,7 @@ class DevicePdfService {
       throw Exception('File name cannot contain invalid characters: \\ / : * ? " < > |');
     }
 
-    final finalFileName = '$cleanBaseName.pdf';
+    final finalFileName = '$cleanBaseName$ext';
 
     if (doc.type == PdfSourceType.file && doc.path.isNotEmpty) {
       final oldFile = File(doc.path);
@@ -115,12 +140,26 @@ class DevicePdfService {
     }
   }
 
-  /// Shares a single PDF document item via the native system share sheet
+  /// Resolves the MIME type from the file path extension
+  static String getMimeType(String path) {
+    final lower = path.toLowerCase();
+    if (lower.endsWith('.pdf')) return 'application/pdf';
+    if (lower.endsWith('.docx')) return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    if (lower.endsWith('.doc')) return 'application/msword';
+    if (lower.endsWith('.xlsx')) return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    if (lower.endsWith('.xls')) return 'application/vnd.ms-excel';
+    if (lower.endsWith('.csv')) return 'text/csv';
+    if (lower.endsWith('.pptx')) return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+    if (lower.endsWith('.ppt')) return 'application/vnd.ms-powerpoint';
+    return 'application/octet-stream';
+  }
+
+  /// Shares a single document item via the native system share sheet
   Future<void> sharePdf(PdfDocumentItem doc) async {
     return sharePdfs([doc]);
   }
 
-  /// Shares multiple PDF documents via the native system share sheet
+  /// Shares multiple documents via the native system share sheet
   Future<void> sharePdfs(List<PdfDocumentItem> docs) async {
     try {
       final List<XFile> xFiles = [];
@@ -130,14 +169,15 @@ class DevicePdfService {
           sharePath = doc.path;
         } else if (doc.bytes != null) {
           final tempDir = await getTemporaryDirectory();
-          final fileName = doc.title.toLowerCase().endsWith('.pdf') ? doc.title : '${doc.title}.pdf';
+          final ext = doc.title.contains('.') ? '' : '.${doc.fileExtension.toLowerCase()}';
+          final fileName = '${doc.title}$ext';
           final tempFile = File('${tempDir.path}/$fileName');
           await tempFile.writeAsBytes(doc.bytes!);
           sharePath = tempFile.path;
         }
 
         if (sharePath != null && File(sharePath).existsSync()) {
-          xFiles.add(XFile(sharePath, mimeType: 'application/pdf', name: doc.title));
+          xFiles.add(XFile(sharePath, mimeType: getMimeType(sharePath), name: doc.title));
         }
       }
 
@@ -145,31 +185,31 @@ class DevicePdfService {
         await SharePlus.instance.share(
           ShareParams(
             files: xFiles,
-            subject: xFiles.length == 1 ? docs.first.title : '${xFiles.length} PDF Documents',
+            subject: xFiles.length == 1 ? docs.first.title : '${xFiles.length} Documents',
           ),
         );
       } else {
-        throw Exception('No valid PDF files available for sharing');
+        throw Exception('No valid files available for sharing');
       }
     } catch (e) {
-      debugPrint('Error sharing PDFs: $e');
+      debugPrint('Error sharing documents: $e');
       rethrow;
     }
   }
 
-  /// Deletes a PDF file from device storage
+  /// Deletes a document file from device storage
   Future<void> deletePdf(PdfDocumentItem doc) async {
     await deletePdfs([doc]);
   }
 
-  /// Deletes multiple PDF files from device storage
+  /// Deletes multiple document files from device storage
   Future<int> deletePdfs(List<PdfDocumentItem> docs) async {
     int deletedCount = 0;
     for (final doc in docs) {
       try {
         if (doc.type == PdfSourceType.file && doc.path.isNotEmpty) {
           final file = File(doc.path);
-          if (!file.path.toLowerCase().endsWith('.pdf')) {
+          if (!isSupportedFile(file.path)) {
             continue;
           }
           if (await file.exists()) {
@@ -338,7 +378,7 @@ class DevicePdfService {
           final name = segments.isNotEmpty ? segments.last : '';
           if (name.startsWith('.')) continue;
 
-          if (entity is File && entity.path.toLowerCase().endsWith('.pdf')) {
+          if (entity is File && isSupportedFile(entity.path)) {
             if (visitedFilePaths.add(entity.path)) {
               try {
                 final stat = entity.statSync();
