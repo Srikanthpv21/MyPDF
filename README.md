@@ -30,6 +30,18 @@
 
 ---
 
+## Screenshots
+
+| All Documents Library | Word Documents | Excel Spreadsheets |
+| :---: | :---: | :---: |
+| <img src="assets/screenshots/01_home_library.png" width="240" alt="All Documents Library" /> | <img src="assets/screenshots/02_word_documents.png" width="240" alt="Word Documents" /> | <img src="assets/screenshots/03_excel_spreadsheets.png" width="240" alt="Excel Spreadsheets" /> |
+
+| Multi-Selection Mode | Continuous PDF Reader | Instant Search Overlay |
+| :---: | :---: | :---: |
+| <img src="assets/screenshots/04_selection_mode.png" width="240" alt="Multi-Selection Mode" /> | <img src="assets/screenshots/05_reader_view.png" width="240" alt="Continuous PDF Reader" /> | <img src="assets/screenshots/06_search_overlay.png" width="240" alt="Instant Search Overlay" /> |
+
+---
+
 ## Key Features
 
 ### 1. High-Performance PDF Reader Engine
